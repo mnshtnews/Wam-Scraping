@@ -1,0 +1,202 @@
+"""
+src/core/pipeline.py
+─────────────────────
+The central orchestration service.
+
+ArticlePipeline wires together all subsystems:
+  Scraper → Classifier → Repository → Telegram
+
+It is the only place that knows about all four subsystems.
+Each subsystem knows nothing about the others.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime
+from typing import Optional
+
+from loguru import logger
+
+from src.classifier.engine import ArticleClassifier
+from src.core.config import Settings
+from src.core.models import Article, RawArticle, ScrapingStatus
+from src.database.cache import DeduplicationCache
+from src.database.repository import ArticleRepository
+from src.scraper.wam_rss_engine import WAMRSSScraper as WAMScraper
+from src.telegram.sender import TelegramSender
+
+
+class ArticlePipeline:
+    """
+    End-to-end article processing pipeline.
+
+    Lifecycle::
+
+        pipeline = ArticlePipeline(settings)
+        await pipeline.start()
+        await pipeline.run_forever()   # blocks until cancelled
+        await pipeline.stop()
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+        self._scraper = WAMScraper(settings)
+        self._classifier = ArticleClassifier(settings)
+        self._repository = ArticleRepository(settings)
+        self._cache = DeduplicationCache(settings)
+        self._telegram = TelegramSender(settings)
+        self._running = False
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    async def start(self) -> None:
+        """Initialise all subsystems and seed deduplication state."""
+        logger.info("Starting ArticlePipeline …")
+
+        # Start infrastructure
+        await self._repository.connect()
+        await self._cache.connect()
+        await self._telegram.start()
+        await self._scraper.start()
+
+        # Seed seen-URL set from DB + Redis to prevent re-processing on restart
+        existing_hashes = await self._repository.get_all_hashes()
+        existing_urls = await self._repository.get_all_urls()
+
+        await self._cache.bulk_mark_seen(existing_hashes)
+        await self._scraper.seed_seen_urls(existing_urls)
+
+        self._running = True
+        logger.info("ArticlePipeline started ✓")
+
+    async def stop(self) -> None:
+        """Gracefully shut down all subsystems."""
+        self._running = False
+        await self._scraper.stop()
+        await self._telegram.stop()
+        await self._repository.disconnect()
+        await self._cache.disconnect()
+        logger.info("ArticlePipeline stopped")
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
+
+    async def run_forever(self) -> None:
+        """
+        Continuously poll all subcategories in round-robin fashion.
+        Runs until cancelled (KeyboardInterrupt / SIGTERM).
+        """
+        logger.info(
+            f"Monitoring {len(self._settings.subcategories)} subcategories "
+            f"with {self._settings.poll_interval_seconds}s interval"
+        )
+
+        while self._running:
+            for sub in self._settings.subcategories:
+                if not self._running:
+                    break
+                try:
+                    await self._poll_subcategory(sub)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.error(f"Unhandled error polling {sub['name']}: {exc}")
+
+            logger.debug(f"Poll cycle complete — sleeping {self._settings.poll_interval_seconds}s")
+            await asyncio.sleep(self._settings.poll_interval_seconds)
+
+    async def run_once(self) -> list[Article]:
+        """
+        Run exactly one poll cycle across all subcategories.
+        Useful for testing or manual triggering via the admin API.
+        """
+        all_articles: list[Article] = []
+        for sub in self._settings.subcategories:
+            articles = await self._poll_subcategory(sub)
+            all_articles.extend(articles)
+        return all_articles
+
+    # ── Per-subcategory poll ──────────────────────────────────────────────────
+
+    async def _poll_subcategory(self, sub: dict) -> list[Article]:
+        """
+        Run a full scrape→classify→save→notify cycle for one subcategory.
+        Returns the list of newly processed articles.
+        """
+        # 1. Scrape new raw articles
+        raw_articles = await self._scraper.poll_subcategory(sub)
+        if not raw_articles:
+            return []
+
+        processed: list[Article] = []
+
+        for raw in raw_articles:
+            article = await self._process_article(raw)
+            if article:
+                processed.append(article)
+
+        return processed
+
+    # ── Per-article processing ────────────────────────────────────────────────
+
+    async def _process_article(self, raw: RawArticle) -> Optional[Article]:
+        """
+        Full pipeline for a single article:
+        deduplicate → classify → save → notify.
+        Returns the saved Article or None if skipped/failed.
+        """
+        # 1. Redis deduplication (fast path — avoids DB round-trip)
+        if await self._cache.is_seen(raw.article_hash):
+            logger.debug(f"Already in cache, skipping: {raw.url}")
+            return None
+
+        # 2. DB deduplication (authoritative)
+        if await self._repository.exists_by_hash(raw.article_hash):
+            await self._cache.mark_seen(raw.article_hash)
+            logger.debug(f"Already in DB, skipping: {raw.url}")
+            return None
+
+        # 3. Classify
+        classification_result = await self._classifier.classify(raw)
+
+        # 4. Build enriched Article domain model
+        article = Article(
+            **raw.model_dump(),
+            classification=classification_result.classification,
+            classification_confidence=classification_result.confidence,
+            classification_method=classification_result.method,
+            detected_uae_entities=classification_result.uae_entities,
+            detected_arab_entities=classification_result.arab_entities,
+            detected_global_entities=classification_result.global_entities,
+            status=ScrapingStatus.CLASSIFIED,
+            scraped_at=datetime.utcnow(),
+        )
+
+        # 5. Persist to Supabase
+        saved_row = await self._repository.save(article)
+        if not saved_row:
+            # Duplicate detected at DB write time (race condition edge case)
+            return None
+
+        await self._cache.mark_seen(article.article_hash)
+
+        # 6. Send to Telegram
+        sent = await self._telegram.send(article)
+        if sent:
+            await self._repository.update_telegram_sent(article.article_hash)
+            article = article.model_copy(
+                update={
+                    "telegram_sent": True,
+                    "telegram_sent_at": datetime.utcnow(),
+                    "status": ScrapingStatus.PUBLISHED,
+                }
+            )
+
+        logger.info(
+            "Article pipeline complete",
+            title=article.title[:60],
+            classification=article.classification.value,
+            telegram_sent=sent,
+        )
+
+        return article
