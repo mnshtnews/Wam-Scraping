@@ -37,9 +37,15 @@ class Settings(BaseSettings):
     telegram_bot_token: str
     telegram_chat_id: str
 
+    @property
+    def effective_telegram_bot_token(self) -> str:
+        return self.telegram_bot_token
+
+    @property
+    def effective_telegram_chat_id(self) -> str:
+        return self.telegram_chat_id
+
     # ── OpenAI ───────────────────────────────────────────────────────────────
-    # Set USE_OPENAI=true in .env to enable GPT-4o-mini as classification fallback.
-    # Set USE_OPENAI=false (default) to rely only on keyword + spaCy — zero API cost.
     use_openai: bool = Field(default=False)
     openai_api_key: Optional[str] = Field(default=None)
     openai_model: str = Field(default="gpt-4o-mini")
@@ -49,12 +55,11 @@ class Settings(BaseSettings):
 
     # ── Scraper ───────────────────────────────────────────────────────────────
     wam_base_url: str = Field(default="https://www.wam.ae")
-    wam_sports_url: str = Field(default="https://www.wam.ae/en/category/sport")
-    poll_interval_seconds: int = Field(default=30)
-    page_load_timeout: int = Field(default=60_000)  # ms
-    element_timeout: int = Field(default=30_000)    # ms
-    max_retries: int = Field(default=5)
-    retry_backoff_base: float = Field(default=5.0)
+    poll_interval_seconds: int = Field(default=120)   # 2 min — WAM is slow to update
+    page_load_timeout: int = Field(default=90_000)    # ms — 90s for Angular cold boot
+    element_timeout: int = Field(default=60_000)      # ms — 60s for subcategory content
+    max_retries: int = Field(default=3)
+    retry_backoff_base: float = Field(default=10.0)
 
     # ── Browser ───────────────────────────────────────────────────────────────
     headless: bool = Field(default=True)
@@ -63,18 +68,35 @@ class Settings(BaseSettings):
     # ── Sentry ────────────────────────────────────────────────────────────────
     sentry_dsn: Optional[str] = Field(default=None)
 
-    # ── Derived ───────────────────────────────────────────────────────────────
+    # ── WAM subcategories ─────────────────────────────────────────────────────
     @property
     def subcategories(self) -> list[dict]:
         """
-        WAM Sports RSS feed definitions.
-        Using RSS instead of HTML scraping — bypasses F5 bot protection.
+        WAM Sports has 3 subcategories navigated via the top tab bar.
+
+        Important: WAM is Angular-based. Navigating directly to a category
+        URL opens the homepage first, then auto-routes to the category.
+        The WAMScraper handles this correctly — these URLs are the canonical
+        deep-link targets that Angular eventually renders.
         """
         return [
             {
-                "name": "Sports",
-                "slug": "sports",
-                "url": "https://www.wam.ae/en/rss/sports",
+                "name": "كرة القدم",
+                "slug": "football",
+                "url": "https://www.wam.ae/en/sports/football",
+                "tab_index": 0,
+            },
+            {
+                "name": "سباقات الخيل والإبل",
+                "slug": "equestrian-camel-racing",
+                "url": "https://www.wam.ae/en/sports/equestrian-camel-racing",
+                "tab_index": 1,
+            },
+            {
+                "name": "رياضات أخرى",
+                "slug": "other-sports",
+                "url": "https://www.wam.ae/en/sports/other-sports",
+                "tab_index": 2,
             },
         ]
 
