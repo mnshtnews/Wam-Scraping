@@ -4,10 +4,12 @@ src/core/pipeline.py
 The central orchestration service.
 
 ArticlePipeline wires together all subsystems:
-  Scraper → Classifier → Repository → Telegram
+  WAMScraper → ArticleClassifier → ArticleRepository → TelegramSender
 
 It is the only place that knows about all four subsystems.
 Each subsystem knows nothing about the others.
+
+Mirrors FilGoal's pipeline.py exactly in structure and quality.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from src.core.config import Settings
 from src.core.models import Article, RawArticle, ScrapingStatus
 from src.database.cache import DeduplicationCache
 from src.database.repository import ArticleRepository
-from src.scraper.wam_rss_engine import WAMRSSScraper as WAMScraper
+from src.scraper.wam_engine import WAMScraper
 from src.telegram.sender import TelegramSender
 
 
@@ -54,13 +56,12 @@ class ArticlePipeline:
         """Initialise all subsystems and seed deduplication state."""
         logger.info("Starting ArticlePipeline …")
 
-        # Start infrastructure
         await self._repository.connect()
         await self._cache.connect()
         await self._telegram.start()
         await self._scraper.start()
 
-        # Seed seen-URL set from DB + Redis to prevent re-processing on restart
+        # Seed seen-URL sets from DB and Redis — prevents re-processing on restart
         existing_hashes = await self._repository.get_all_hashes()
         existing_urls = await self._repository.get_all_urls()
 
@@ -83,12 +84,18 @@ class ArticlePipeline:
 
     async def run_forever(self) -> None:
         """
-        Continuously poll all subcategories in round-robin fashion.
+        Continuously poll all three WAM subcategories in round-robin fashion.
         Runs until cancelled (KeyboardInterrupt / SIGTERM).
+
+        WAM note: each poll cycle takes longer than FilGoal because of Angular's
+        loading times. The poll_interval_seconds config value (default 120s)
+        accounts for this — it is the *sleep* between cycles, not the cycle
+        duration. A full 3-subcategory cycle takes ~3-5 minutes total.
         """
         logger.info(
-            f"Monitoring {len(self._settings.subcategories)} subcategories "
-            f"with {self._settings.poll_interval_seconds}s interval"
+            f"Monitoring {len(self._settings.subcategories)} WAM subcategories "
+            f"with {self._settings.poll_interval_seconds}s sleep between cycles",
+            subcategories=[s["name"] for s in self._settings.subcategories],
         )
 
         while self._running:
@@ -100,9 +107,11 @@ class ArticlePipeline:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    logger.error(f"Unhandled error polling {sub['name']}: {exc}")
+                    logger.error(f"Unhandled error polling WAM {sub['name']}: {exc}")
 
-            logger.debug(f"Poll cycle complete — sleeping {self._settings.poll_interval_seconds}s")
+            logger.debug(
+                f"WAM poll cycle complete — sleeping {self._settings.poll_interval_seconds}s"
+            )
             await asyncio.sleep(self._settings.poll_interval_seconds)
 
     async def run_once(self) -> list[Article]:
@@ -120,16 +129,14 @@ class ArticlePipeline:
 
     async def _poll_subcategory(self, sub: dict) -> list[Article]:
         """
-        Run a full scrape→classify→save→notify cycle for one subcategory.
+        Run a full scrape → classify → save → notify cycle for one subcategory.
         Returns the list of newly processed articles.
         """
-        # 1. Scrape new raw articles
         raw_articles = await self._scraper.poll_subcategory(sub)
         if not raw_articles:
             return []
 
         processed: list[Article] = []
-
         for raw in raw_articles:
             article = await self._process_article(raw)
             if article:
@@ -144,6 +151,9 @@ class ArticlePipeline:
         Full pipeline for a single article:
         deduplicate → classify → save → notify.
         Returns the saved Article or None if skipped/failed.
+
+        Identical to FilGoal's _process_article() — no WAM-specific changes
+        needed here because the domain model is shared.
         """
         # 1. Redis deduplication (fast path — avoids DB round-trip)
         if await self._cache.is_seen(raw.article_hash):
@@ -193,9 +203,10 @@ class ArticlePipeline:
             )
 
         logger.info(
-            "Article pipeline complete",
+            "WAM article pipeline complete",
             title=article.title[:60],
             classification=article.classification.value,
+            subcategory=article.subcategory,
             telegram_sent=sent,
         )
 
