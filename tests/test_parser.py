@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.scraper.parser import parse_article_list, _parse_date, _absolute_url
+from src.scraper.wam_parser import parse_article_list, _parse_date, _absolute_url
 
 
 # Sample HTML taken directly from the WAM website (from the brief)
