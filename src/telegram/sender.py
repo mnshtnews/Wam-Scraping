@@ -1,18 +1,21 @@
 """
 src/telegram/sender.py
 ───────────────────────
-Telegram notification module.
+Telegram notification module — professional WAM news card format.
 
-Sends a richly-formatted message with:
+Sends a richly-formatted HTML message with:
   • Classification badge (🇦🇪 / 🌍 / 🌐)
+  • Subcategory label (كرة القدم / سباقات الخيل والإبل / رياضات أخرى)
   • Article title (bold)
   • Publish date
   • Short summary / excerpt
-  • Image (sent as photo with caption)
-  • Source link button
+  • Image (sent as photo with caption when available)
+  • Inline keyboard button → full article
 
-Uses aiogram 3.x in non-dispatcher mode (direct Bot API calls)
-for simplicity inside an async context.
+Uses aiogram 3.x in non-dispatcher mode (direct Bot API calls).
+Rate-limited to 1 message per 2.5s (Telegram allows 30/min).
+
+Mirrors FilGoal's telegram/sender.py quality exactly.
 """
 
 from __future__ import annotations
@@ -31,31 +34,27 @@ from loguru import logger
 from src.core.config import Settings
 from src.core.models import Article, NewsClassification
 
-# Classification display config
+# Classification display metadata
 _CLASSIFICATION_META = {
     NewsClassification.UAE: {
         "emoji": "🇦🇪",
-        "label": "UAE News",
-        "color_tag": "#00732F",
+        "label": "أخبار الإمارات",
     },
     NewsClassification.ARAB: {
         "emoji": "🌍",
-        "label": "Arab News",
-        "color_tag": "#006C35",
+        "label": "أخبار عربية",
     },
     NewsClassification.GLOBAL: {
         "emoji": "🌐",
-        "label": "Global News",
-        "color_tag": "#0047AB",
+        "label": "أخبار عالمية",
     },
     NewsClassification.UNCLASSIFIED: {
-        "emoji": "❓",
-        "label": "Unclassified",
-        "color_tag": "#888888",
+        "emoji": "📰",
+        "label": "أخبار رياضية",
     },
 }
 
-# Telegram caption hard limit (1024 chars for photos, 4096 for text)
+# Telegram hard limits
 _PHOTO_CAPTION_LIMIT = 950
 _TEXT_MESSAGE_LIMIT = 3800
 
@@ -75,16 +74,15 @@ class TelegramSender:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._bot: Optional[Bot] = None
-        # Rate limiting: max 1 message per 2 seconds (Telegram limit: 30/min)
         self._last_sent: float = 0.0
-        self._min_interval: float = 2.5
+        self._min_interval: float = 2.5   # max 24 messages/min — safely under Telegram's 30/min
 
     async def start(self) -> None:
         self._bot = Bot(
-            token=self._settings.telegram_bot_token,
+            token=self._settings.effective_telegram_bot_token,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
-        logger.info("Telegram bot initialised")
+        logger.info("WAM Telegram bot initialised")
 
     async def stop(self) -> None:
         if self._bot:
@@ -95,6 +93,7 @@ class TelegramSender:
         """
         Send the article to Telegram.
         Returns True on success, False on failure.
+        Tries photo first; falls back to text if photo fails.
         """
         if not self._bot:
             logger.error("TelegramSender not started")
@@ -111,7 +110,7 @@ class TelegramSender:
             logger.error(f"Telegram send failed for {article.url}: {exc}")
             return False
 
-    # ── Private helpers ───────────────────────────────────────────────────────
+    # ── Send methods ──────────────────────────────────────────────────────────
 
     async def _send_photo(self, article: Article) -> bool:
         """Send article as a photo message with caption."""
@@ -120,7 +119,7 @@ class TelegramSender:
 
         try:
             await self._bot.send_photo(  # type: ignore[union-attr]
-                chat_id=self._settings.telegram_chat_id,
+                chat_id=self._settings.effective_telegram_chat_id,
                 photo=article.image_url,
                 caption=caption,
                 reply_markup=keyboard,
@@ -134,11 +133,11 @@ class TelegramSender:
 
     async def _send_text(self, article: Article) -> bool:
         """Send article as a text message."""
-        text = self._build_text_message(article)
+        text = self._build_caption(article, limit=_TEXT_MESSAGE_LIMIT)
         keyboard = self._build_keyboard(article)
 
         await self._bot.send_message(  # type: ignore[union-attr]
-            chat_id=self._settings.telegram_chat_id,
+            chat_id=self._settings.effective_telegram_chat_id,
             text=text,
             reply_markup=keyboard,
             parse_mode=ParseMode.HTML,
@@ -147,70 +146,74 @@ class TelegramSender:
         logger.info(f"Telegram text sent: {article.title[:60]}")
         return True
 
+    # ── Message builder ───────────────────────────────────────────────────────
+
     def _build_caption(self, article: Article, limit: int = 950) -> str:
-        """Build a concise photo caption (≤ limit chars)."""
+        """
+        Build the Telegram message body.
+
+        Format:
+          🇦🇪 أخبار الإمارات  |  كرة القدم
+
+          <b>Title</b>
+
+          Content preview…
+
+          🕐 Date
+
+          اقرأ المقال كاملاً
+        """
         meta = _CLASSIFICATION_META[article.classification]
         emoji = meta["emoji"]
         label = meta["label"]
 
         date_str = self._format_date(article.publish_date)
-        summary = self._get_summary(article, max_chars=300)
+        summary = self._get_summary(article, max_chars=350)
 
-        caption = (
-            f"{emoji} <b>{label}</b>  |  {article.subcategory}\n\n"
-            f"<b>{self._escape(article.title)}</b>\n\n"
-        )
+        lines: list[str] = []
 
-        if date_str:
-            caption += f"🕐 {date_str}\n\n"
+        # Header: classification + subcategory
+        lines.append(f"{emoji} <b>{self._escape(label)}</b>  |  {self._escape(article.subcategory)}")
+        lines.append("")
 
+        # Title
+        lines.append(f"<b>{self._escape(article.title)}</b>")
+        lines.append("")
+
+        # Content preview
         if summary:
-            caption += f"{self._escape(summary)}\n\n"
+            lines.append(self._escape(summary))
+            lines.append("")
 
-        caption += f"📰 <a href='{article.url}'>Read full article</a>"
+        # Date
+        if date_str:
+            lines.append(f"🕐 <i>{date_str}</i>")
+            lines.append("")
 
-        # Truncate if needed
+        # Source link
+        lines.append(f'<a href="{article.url}">اقرأ المقال كاملاً</a>')
+
+        caption = "\n".join(lines)
+
+        # Safe truncation — preserve source link at end
         if len(caption) > limit:
-            caption = caption[: limit - 30] + "…\n\n📰 <a href='{article.url}'>Read more</a>"
+            caption = caption[: limit - 80].rsplit("\n", 1)[0]
+            caption += f'\n\n<a href="{article.url}">اقرأ المقال كاملاً</a>'
 
         return caption
 
-    def _build_text_message(self, article: Article) -> str:
-        """Build a full text message."""
-        meta = _CLASSIFICATION_META[article.classification]
-        emoji = meta["emoji"]
-        label = meta["label"]
-
-        date_str = self._format_date(article.publish_date)
-        summary = self._get_summary(article, max_chars=600)
-
-        parts = [
-            f"{emoji} <b>{label}</b>  |  {article.subcategory}\n",
-            f"<b>{self._escape(article.title)}</b>\n",
-        ]
-
-        if date_str:
-            parts.append(f"🕐 {date_str}\n")
-
-        if summary:
-            parts.append(f"\n{self._escape(summary)}\n")
-
-        parts.append(f"\n🔗 {article.url}")
-
-        return "\n".join(parts)[:_TEXT_MESSAGE_LIMIT]
-
     def _build_keyboard(self, article: Article) -> InlineKeyboardMarkup:
-        """Build an inline keyboard with a 'Read Article' button."""
+        """Inline keyboard with a single 'Read full article' button."""
         return InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="📖 Read Full Article",
-                        url=article.url,
-                    )
-                ]
-            ]
+            inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="📖 اقرأ المقال كاملاً",
+                    url=article.url,
+                )
+            ]]
         )
+
+    # ── Utilities ─────────────────────────────────────────────────────────────
 
     async def _rate_limit(self) -> None:
         """Enforce minimum interval between Telegram messages."""
@@ -227,12 +230,11 @@ class TelegramSender:
         return dt.strftime("%d %b %Y, %H:%M UTC")
 
     @staticmethod
-    def _get_summary(article: Article, max_chars: int = 400) -> str:
+    def _get_summary(article: Article, max_chars: int = 350) -> str:
         """Return the best available short text for the notification."""
         text = article.summary or article.content or ""
         if not text:
             return ""
-        # Take first paragraph / first max_chars chars
         paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
         first = paragraphs[0] if paragraphs else text
         return textwrap.shorten(first, width=max_chars, placeholder="…")
@@ -242,6 +244,6 @@ class TelegramSender:
         """Escape HTML special characters for Telegram HTML parse mode."""
         return (
             text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
         )
