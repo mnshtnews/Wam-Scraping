@@ -55,9 +55,9 @@ class Settings(BaseSettings):
 
     # ── Scraper ───────────────────────────────────────────────────────────────
     wam_base_url: str = Field(default="https://www.wam.ae")
-    poll_interval_seconds: int = Field(default=120)   # 2 min — WAM is slow to update
-    page_load_timeout: int = Field(default=90_000)    # ms — 90s for Angular cold boot
-    element_timeout: int = Field(default=60_000)      # ms — 60s for subcategory content
+    poll_interval_seconds: int = Field(default=120)
+    page_load_timeout: int = Field(default=90_000)
+    element_timeout: int = Field(default=60_000)
     max_retries: int = Field(default=3)
     retry_backoff_base: float = Field(default=10.0)
 
@@ -72,31 +72,36 @@ class Settings(BaseSettings):
     @property
     def subcategories(self) -> list[dict]:
         """
-        WAM Sports has 3 subcategories navigated via the top tab bar.
+        WAM Sports subcategories — confirmed from live site (diagnose3.py).
 
-        Important: WAM is Angular-based. Navigating directly to a category
-        URL opens the homepage first, then auto-routes to the category.
-        The WAMScraper handles this correctly — these URLs are the canonical
-        deep-link targets that Angular eventually renders.
+        Navigation flow (required — direct URL goto does NOT work):
+          1. Load https://www.wam.ae/en  (English homepage)
+          2. Click the "Sports" tab
+          3. Click the subcategory link matching `category_path`
+
+        `category_path` values confirmed from Step 8 of diagnose3.py:
+          /en/category/football     → كرة قدم
+          /en/category/other-sports → رياضات أخرى
+          /en/category/sport        → كل الرياضة (includes Equestrian)
+
+        Note: Equestrian / Camel Racing has no dedicated nav link on the
+        current WAM site — it is covered by the general sport feed.
         """
         return [
             {
                 "name": "كرة القدم",
                 "slug": "football",
-                "url": "https://www.wam.ae/en/sports/football",
-                "tab_index": 0,
-            },
-            {
-                "name": "سباقات الخيل والإبل",
-                "slug": "equestrian-camel-racing",
-                "url": "https://www.wam.ae/en/sports/equestrian-camel-racing",
-                "tab_index": 1,
+                "category_path": "/en/category/football",
             },
             {
                 "name": "رياضات أخرى",
                 "slug": "other-sports",
-                "url": "https://www.wam.ae/en/sports/other-sports",
-                "tab_index": 2,
+                "category_path": "/en/category/other-sports",
+            },
+            {
+                "name": "رياضة عامة",
+                "slug": "sport",
+                "category_path": "/en/category/sport",
             },
         ]
 
