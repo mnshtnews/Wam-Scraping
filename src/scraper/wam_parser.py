@@ -402,10 +402,10 @@ def _looks_like_article_url(url: str) -> bool:
     """
     if not url.startswith("https://www.wam.ae"):
         return False
-    if "/en/article/" not in url:
+    if "/ar/article/" not in url:
         return False
     # Ensure there's something after /en/article/
-    after = url.split("/en/article/")[-1].strip("/")
+    after = url.split("/ar/article/")[-1].strip("/")
     return len(after) > 5
 
 
