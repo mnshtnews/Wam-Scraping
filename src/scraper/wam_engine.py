@@ -54,7 +54,7 @@ from src.scraper.wam_parser import parse_article_detail, parse_article_list
 
 # ── Navigation constants ───────────────────────────────────────────────────────
 # Always start from the English homepage — WAM redirects /ar/ by default
-WAM_EN_HOME = "https://www.wam.ae/en"
+WAM_EN_HOME = "https://www.wam.ae/ar"
 
 # The Sports tab text in English (used for text-based tab matching)
 _SPORTS_TAB_TEXT = "Sports"
@@ -192,7 +192,7 @@ class WAMScraper:
 
         # Page is dead — recreate
         self._sports_loaded = False
-        logger.info("Creating new browser page and loading WAM English homepage")
+        logger.info("Creating new browser page and loading WAM Arabic homepage")
         self._page = await self._browser_manager.new_page()
 
         # Navigate to the English homepage explicitly.
@@ -361,7 +361,7 @@ class WAMScraper:
             for link in links:
                 href = await link.get_attribute("href") or ""
                 # Exclude the parent sport category link when we want a sub
-                if slug in href and href != "/en/category/sport":
+                if slug in href and href != "/ar/category/sport":
                     await link.click()
                     logger.debug(f"Clicked partial category link: {href}")
                     return True
