@@ -1,21 +1,14 @@
 """
 src/core/pipeline.py
 ─────────────────────
-The central orchestration service.
-
-ArticlePipeline wires together all subsystems:
-  WAMScraper → ArticleClassifier → ArticleRepository → TelegramSender
-
-It is the only place that knows about all four subsystems.
-Each subsystem knows nothing about the others.
-
-Mirrors FilGoal's pipeline.py exactly in structure and quality.
+FIX 1: On first run, only accept articles published AFTER startup time.
+FIX 2: Articles are translated to Arabic before saving and sending.
 """
 
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from loguru import logger
@@ -27,19 +20,10 @@ from src.database.cache import DeduplicationCache
 from src.database.repository import ArticleRepository
 from src.scraper.wam_engine import WAMScraper
 from src.telegram.sender import TelegramSender
+from src.translator.engine import ArticleTranslator   # NEW
 
 
 class ArticlePipeline:
-    """
-    End-to-end article processing pipeline.
-
-    Lifecycle::
-
-        pipeline = ArticlePipeline(settings)
-        await pipeline.start()
-        await pipeline.run_forever()   # blocks until cancelled
-        await pipeline.stop()
-    """
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
@@ -48,20 +32,20 @@ class ArticlePipeline:
         self._repository = ArticleRepository(settings)
         self._cache = DeduplicationCache(settings)
         self._telegram = TelegramSender(settings)
+        self._translator = ArticleTranslator(settings)   # NEW
         self._running = False
+        # FIX 1: record exact startup time — reject anything older
+        self._startup_time: datetime = datetime.now(timezone.utc)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Initialise all subsystems and seed deduplication state."""
         logger.info("Starting ArticlePipeline …")
-
         await self._repository.connect()
         await self._cache.connect()
         await self._telegram.start()
         await self._scraper.start()
 
-        # Seed seen-URL sets from DB and Redis — prevents re-processing on restart
         existing_hashes = await self._repository.get_all_hashes()
         existing_urls = await self._repository.get_all_urls()
 
@@ -69,10 +53,11 @@ class ArticlePipeline:
         await self._scraper.seed_seen_urls(existing_urls)
 
         self._running = True
-        logger.info("ArticlePipeline started ✓")
+        logger.info(
+            f"ArticlePipeline started ✓  (startup_time={self._startup_time.isoformat()})"
+        )
 
     async def stop(self) -> None:
-        """Gracefully shut down all subsystems."""
         self._running = False
         await self._scraper.stop()
         await self._telegram.stop()
@@ -83,15 +68,6 @@ class ArticlePipeline:
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     async def run_forever(self) -> None:
-        """
-        Continuously poll all three WAM subcategories in round-robin fashion.
-        Runs until cancelled (KeyboardInterrupt / SIGTERM).
-
-        WAM note: each poll cycle takes longer than FilGoal because of Angular's
-        loading times. The poll_interval_seconds config value (default 120s)
-        accounts for this — it is the *sleep* between cycles, not the cycle
-        duration. A full 3-subcategory cycle takes ~3-5 minutes total.
-        """
         logger.info(
             f"Monitoring {len(self._settings.subcategories)} WAM subcategories "
             f"with {self._settings.poll_interval_seconds}s sleep between cycles",
@@ -115,10 +91,6 @@ class ArticlePipeline:
             await asyncio.sleep(self._settings.poll_interval_seconds)
 
     async def run_once(self) -> list[Article]:
-        """
-        Run exactly one poll cycle across all subcategories.
-        Useful for testing or manual triggering via the admin API.
-        """
         all_articles: list[Article] = []
         for sub in self._settings.subcategories:
             articles = await self._poll_subcategory(sub)
@@ -128,10 +100,6 @@ class ArticlePipeline:
     # ── Per-subcategory poll ──────────────────────────────────────────────────
 
     async def _poll_subcategory(self, sub: dict) -> list[Article]:
-        """
-        Run a full scrape → classify → save → notify cycle for one subcategory.
-        Returns the list of newly processed articles.
-        """
         raw_articles = await self._scraper.poll_subcategory(sub)
         if not raw_articles:
             return []
@@ -147,29 +115,37 @@ class ArticlePipeline:
     # ── Per-article processing ────────────────────────────────────────────────
 
     async def _process_article(self, raw: RawArticle) -> Optional[Article]:
-        """
-        Full pipeline for a single article:
-        deduplicate → classify → save → notify.
-        Returns the saved Article or None if skipped/failed.
 
-        Identical to FilGoal's _process_article() — no WAM-specific changes
-        needed here because the domain model is shared.
-        """
-        # 1. Redis deduplication (fast path — avoids DB round-trip)
+        # ── FIX 1: reject articles older than startup time ────────────────────
+        if raw.publish_date:
+            pub = raw.publish_date
+            # make timezone-aware for comparison
+            if pub.tzinfo is None:
+                pub = pub.replace(tzinfo=timezone.utc)
+            if pub < self._startup_time:
+                logger.debug(
+                    f"Skipping old article (published {pub.isoformat()}): {raw.url}"
+                )
+                return None
+        # If publish_date is missing, we allow it through (can't know age)
+
+        # ── Deduplication ─────────────────────────────────────────────────────
         if await self._cache.is_seen(raw.article_hash):
             logger.debug(f"Already in cache, skipping: {raw.url}")
             return None
 
-        # 2. DB deduplication (authoritative)
         if await self._repository.exists_by_hash(raw.article_hash):
             await self._cache.mark_seen(raw.article_hash)
             logger.debug(f"Already in DB, skipping: {raw.url}")
             return None
 
-        # 3. Classify
+        # ── FIX 2: translate to Arabic ────────────────────────────────────────
+        raw = await self._translator.translate(raw)
+
+        # ── Classify ──────────────────────────────────────────────────────────
         classification_result = await self._classifier.classify(raw)
 
-        # 4. Build enriched Article domain model
+        # ── Build Article ─────────────────────────────────────────────────────
         article = Article(
             **raw.model_dump(),
             classification=classification_result.classification,
@@ -182,15 +158,14 @@ class ArticlePipeline:
             scraped_at=datetime.utcnow(),
         )
 
-        # 5. Persist to Supabase
+        # ── Persist ───────────────────────────────────────────────────────────
         saved_row = await self._repository.save(article)
         if not saved_row:
-            # Duplicate detected at DB write time (race condition edge case)
             return None
 
         await self._cache.mark_seen(article.article_hash)
 
-        # 6. Send to Telegram
+        # ── Send to Telegram ──────────────────────────────────────────────────
         sent = await self._telegram.send(article)
         if sent:
             await self._repository.update_telegram_sent(article.article_hash)
