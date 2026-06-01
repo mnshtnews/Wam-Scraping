@@ -2,7 +2,7 @@
 src/core/pipeline.py
 ─────────────────────
 FIX 1: On first run, only accept articles published AFTER startup time.
-FIX 2: Articles are translated to Arabic before saving and sending.
+NOTE:  No translation needed — WAM Arabic version (/ar/) is scraped directly.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from src.database.cache import DeduplicationCache
 from src.database.repository import ArticleRepository
 from src.scraper.wam_engine import WAMScraper
 from src.telegram.sender import TelegramSender
-from src.translator.engine import ArticleTranslator   # NEW
 
 
 class ArticlePipeline:
@@ -32,7 +31,6 @@ class ArticlePipeline:
         self._repository = ArticleRepository(settings)
         self._cache = DeduplicationCache(settings)
         self._telegram = TelegramSender(settings)
-        self._translator = ArticleTranslator(settings)   # NEW
         self._running = False
         # FIX 1: record exact startup time — reject anything older
         self._startup_time: datetime = datetime.now(timezone.utc)
@@ -119,7 +117,6 @@ class ArticlePipeline:
         # ── FIX 1: reject articles older than startup time ────────────────────
         if raw.publish_date:
             pub = raw.publish_date
-            # make timezone-aware for comparison
             if pub.tzinfo is None:
                 pub = pub.replace(tzinfo=timezone.utc)
             if pub < self._startup_time:
@@ -127,7 +124,6 @@ class ArticlePipeline:
                     f"Skipping old article (published {pub.isoformat()}): {raw.url}"
                 )
                 return None
-        # If publish_date is missing, we allow it through (can't know age)
 
         # ── Deduplication ─────────────────────────────────────────────────────
         if await self._cache.is_seen(raw.article_hash):
@@ -138,9 +134,6 @@ class ArticlePipeline:
             await self._cache.mark_seen(raw.article_hash)
             logger.debug(f"Already in DB, skipping: {raw.url}")
             return None
-
-        # ── FIX 2: translate to Arabic ────────────────────────────────────────
-        raw = await self._translator.translate(raw)
 
         # ── Classify ──────────────────────────────────────────────────────────
         classification_result = await self._classifier.classify(raw)
