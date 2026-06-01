@@ -75,14 +75,14 @@ class Settings(BaseSettings):
         WAM Sports subcategories — confirmed from live site (diagnose3.py).
 
         Navigation flow (required — direct URL goto does NOT work):
-          1. Load https://www.wam.ae/en  (English homepage)
+          1. Load https://www.wam.ae/ar  (English homepage)
           2. Click the "Sports" tab
           3. Click the subcategory link matching `category_path`
 
         `category_path` values confirmed from Step 8 of diagnose3.py:
-          /en/category/football     → كرة قدم
-          /en/category/other-sports → رياضات أخرى
-          /en/category/sport        → كل الرياضة (includes Equestrian)
+          /ar/category/football     → كرة قدم
+          /ar/category/other-sports → رياضات أخرى
+          /ar/category/sport        → كل الرياضة (includes Equestrian)
 
         Note: Equestrian / Camel Racing has no dedicated nav link on the
         current WAM site — it is covered by the general sport feed.
@@ -91,17 +91,17 @@ class Settings(BaseSettings):
             {
                 "name": "كرة القدم",
                 "slug": "football",
-                "category_path": "/en/category/football",
+                "category_path": "/ar/category/football",
             },
             {
                 "name": "رياضات أخرى",
                 "slug": "other-sports",
-                "category_path": "/en/category/other-sports",
+                "category_path": "/ar/category/other-sports",
             },
             {
                 "name": "رياضة عامة",
                 "slug": "sport",
-                "category_path": "/en/category/sport",
+                "category_path": "/ar/category/sport",
             },
         ]
 
