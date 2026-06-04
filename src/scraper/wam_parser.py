@@ -1,26 +1,51 @@
 """
 src/scraper/wam_parser.py
 ─────────────────────────
-HTML parsing layer for WAM (wam.ae) articles.
+Selectors confirmed from diagnose5.py real HTML:
 
-CONFIRMED selectors from live site (diagnose3.py):
-  Cards:     .single-blog-post   (32 found)
-             app-article-item-bottom-text  (13 found — subset with text below)
-  Container: .art-img  (32 found)
-  Title:     a.post-title  (confirmed in slide HTML)
-  Image:     .blog-thumbnail img  (confirmed in slide HTML)
-  Date:      .post-date  (confirmed in class dump)
-  Summary:   span.text-muted small  (confirmed in slide HTML)
-  URL:       a[href*='/en/article/']
-  URL fmt:   /en/article/<alphanum-id>-<title-slug>
-             e.g. /en/article/178wkh2-uae-president-vps-offer-condolences
+Card types (two layouts):
+  style-2 (featured/top card):
+    <div class="art-img single-blog-post style-2 ng-star-inserted">
+      <div class="blog-thumbnail">
+        <a href="/ar/article/..."><img src="https://assets.wam.ae/..."/></a>
+      </div>
+      <div class="blog-content">
+        <a class="post-title description" href="/ar/article/...">TITLE TEXT</a>
+        <div class="mt-1 description">
+          <span class="text-muted font-weight-light"><small>SUMMARY</small></span>
+        </div>
+        <div><span class="post-date">منذ 9 ساعات</span></div>
+      </div>
+    </div>
+
+  style-4 (list cards):
+    <div class="single-blog-post d-flex style-4 art-img ng-star-inserted">
+      <div class="blog-thumbnail position-relative">
+        <a href="/ar/article/..."><img src="https://assets.wam.ae/..."/></a>
+      </div>
+      <div class="blog-content">
+        <a class="post-title" href="/ar/article/...">TITLE TEXT</a>
+        <div class="mt-1 description">
+          <span class="text-muted font-weight-light"><small>SUMMARY</small></span>
+        </div>
+        <ul class="p-0"><li>
+          <span class="post-date">منذ 11 ساعة  OR  الاثنين، 25 مايو 2026 3:53 م</span>
+        </li></ul>
+      </div>
+    </div>
+
+Key observations:
+  - Title text is DIRECTLY inside <a class="post-title"> — no nested div
+  - Image src is a full URL (https://assets.wam.ae/...) — not data-src
+  - Date is relative Arabic ("منذ X ساعات") or absolute Arabic ("الاثنين، 25 مايو 2026")
+  - URL format: /ar/article/<alphanum-id>-<url-encoded-arabic-slug>
 """
 
 from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from urllib.parse import urljoin
 
@@ -32,69 +57,31 @@ from src.core.models import RawArticle
 
 WAM_BASE = "https://www.wam.ae"
 
-# ── Confirmed card selectors (ordered by specificity) ─────────────────────────
-_ARTICLE_CARD_SELECTORS = [
-    ".single-blog-post",                 # 32 confirmed — primary selector
-    "app-article-item-bottom-text",      # 13 confirmed — more specific subtype
-    ".art-img",                          # 32 confirmed — wrapper
-    "[class*='single-blog-post']",
-    "[class*='art-img']",
-]
+# ── Card selector — both style-2 and style-4 share .single-blog-post ─────────
+_CARD_SELECTOR = ".single-blog-post"
 
-# ── Confirmed field selectors ─────────────────────────────────────────────────
-_TITLE_SELECTORS = [
-    "a.post-title",           # confirmed from slide HTML: <a class="post-title description" href=...>
-    "a.post-title.description",
-    ".post-title",
-    "a[class*='post-title']",
-]
+# ── Field selectors (confirmed from real HTML) ────────────────────────────────
+_TITLE_SEL    = "a.post-title"          # works for both style-2 and style-4
+_IMAGE_SEL    = ".blog-thumbnail img"   # img directly inside thumbnail anchor
+_SUMMARY_SEL  = "span.text-muted small" # confirmed in both layouts
+_DATE_SEL     = "span.post-date"        # confirmed in both layouts
 
 _CONTENT_SELECTORS = [
+    ".blog-content",
     ".article-body",
     ".article-content",
-    ".blog-content",
     "[class*='article-body']",
     "[class*='article-content']",
     ".ng-star-inserted",
-    "main article",
-]
-
-_IMAGE_SELECTORS = [
-    ".blog-thumbnail img",    # confirmed from slide HTML
-    ".blog-thumbnail a img",
-    "a > img",
-    "article img",
-    "figure img",
-    "img[class*='article']",
-    "img[class*='hero']",
-    "img[class*='thumb']",
-]
-
-_DATE_SELECTORS = [
-    ".post-date",             # confirmed from class dump
-    "time",
-    "[class*='post-date']",
-    "[class*='date']",
-    "span.text-muted",
-]
-
-_SUMMARY_SELECTORS = [
-    "span.text-muted small",  # confirmed from slide HTML: <small>excerpt text...</small>
-    "small",
-    ".description small",
-    "p.description",
-    ".description",
-    "p",
 ]
 
 _NOISE_SELECTORS = [
-    "script", "style", "noscript", "iframe", "ins", ".adsbygoogle",
-    ".related-articles", ".related-posts", "[class*='related']",
+    "script", "style", "noscript", "iframe",
+    ".related-articles", ".related-posts",
     "nav", "header", "footer",
-    ".social-share", "[class*='share']",
-    ".tags-section", ".article-tags",
+    ".social-share", ".tags-section",
     ".comments-section", ".newsletter-signup",
-    ".author-bio", ".author-box",
+    ".overlay",
 ]
 
 
@@ -107,33 +94,17 @@ def parse_article_list(
     subcategory: str,
     base_url: str = WAM_BASE,
 ) -> list[RawArticle]:
-    """
-    Parse a WAM category page HTML and return RawArticle stubs.
-    Handles the case where multiple card selectors exist in the same DOM
-    by deduplicating on URL.
-    """
+    """Parse WAM category listing HTML → list of RawArticle stubs."""
     soup = BeautifulSoup(html, "lxml")
     seen_urls: set[str] = set()
     articles: list[RawArticle] = []
 
-    # Find the best card container
-    cards: list[Tag] = []
-    for selector in _ARTICLE_CARD_SELECTORS:
-        found = soup.select(selector)
-        if found:
-            cards = found
-            logger.debug(
-                f"Using selector '{selector}' — {len(found)} cards found",
-                subcategory=subcategory,
-            )
-            break
-
+    cards = soup.select(_CARD_SELECTOR)
     if not cards:
-        logger.warning(
-            f"No article cards found in WAM HTML for subcategory={subcategory}. "
-            f"Angular may not have rendered yet."
-        )
+        logger.warning(f"No cards found for subcategory={subcategory}")
         return []
+
+    logger.debug(f"{len(cards)} cards found", subcategory=subcategory)
 
     for card in cards:
         try:
@@ -142,38 +113,32 @@ def parse_article_list(
                 seen_urls.add(article.url)
                 articles.append(article)
         except Exception as exc:
-            logger.warning(f"Failed to parse WAM card: {exc}")
+            logger.warning(f"Card parse error: {exc}")
 
-    logger.info(
-        f"Parsed {len(articles)} unique articles from WAM listing",
-        subcategory=subcategory,
-    )
+    logger.info(f"Parsed {len(articles)} unique articles", subcategory=subcategory)
     return articles
 
 
 def parse_article_detail(html: str, raw: RawArticle) -> RawArticle:
-    """Enrich a RawArticle stub with full body, precise date, and image."""
+    """Enrich stub with full body, precise date, and image from detail page."""
     soup = BeautifulSoup(html, "lxml")
     updates: dict = {}
 
     if not raw.image_url:
-        img = _extract_image(soup)
+        img = _extract_image_detail(soup)
         if img:
             updates["image_url"] = img
 
     if not raw.publish_date:
-        dt = _extract_date(soup)
+        dt = _extract_date_detail(soup)
         if dt:
             updates["publish_date"] = dt
 
-    content = _extract_full_content(soup)
+    content = _extract_content(soup)
     if content:
         updates["content"] = content
 
-    if updates:
-        raw = raw.model_copy(update=updates)
-
-    return raw
+    return raw.model_copy(update=updates) if updates else raw
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -181,83 +146,52 @@ def parse_article_detail(html: str, raw: RawArticle) -> RawArticle:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_card(card: Tag, subcategory: str, base_url: str) -> Optional[RawArticle]:
-    """Extract structured data from one WAM article card."""
 
-    # ── Title & URL ───────────────────────────────────────────────────────────
-    title_tag: Optional[Tag] = None
-    for sel in _TITLE_SELECTORS:
-        title_tag = card.select_one(sel)
-        if title_tag:
-            break
-
-    # Fallback: any anchor inside the card with substantial text
-    if not title_tag:
-        for a in card.find_all("a", href=True):
-            href = str(a.get("href", ""))
-            if "/article/" in href:
-                title_tag = a
-                break
-
+    # ── Title ─────────────────────────────────────────────────────────────────
+    title_tag = card.select_one(_TITLE_SEL)
     if not title_tag:
         return None
 
-    title = _clean_text(title_tag.get_text(strip=True))
+    title = _clean(title_tag.get_text(strip=True))
     if not title:
         return None
 
-    # Extract href
-    href: Optional[str] = None
-    if title_tag.name == "a":
-        href = str(title_tag.get("href", ""))
-    if not href:
-        anchor = card.find("a", href=True)
-        if anchor:
-            href = str(anchor.get("href", ""))
-
+    # ── URL ───────────────────────────────────────────────────────────────────
+    href = str(title_tag.get("href", "")).strip()
     if not href:
         return None
 
-    url = _absolute_url(href, base_url)
-
-    if not _looks_like_article_url(url):
-        logger.debug(f"Rejected non-article URL: {url}")
+    url = _abs(href, base_url)
+    if not _is_article_url(url):
+        logger.debug(f"Rejected URL: {url}")
         return None
 
     # ── Image ─────────────────────────────────────────────────────────────────
     image_url: Optional[str] = None
-    for sel in _IMAGE_SELECTORS:
-        img = card.select_one(sel)
-        if img:
-            src = str(img.get("data-src") or img.get("src") or "")
-            if src and "placeholder" not in src and src.startswith("http"):
-                image_url = src
-                break
-            elif src and "placeholder" not in src:
-                image_url = _absolute_url(src, base_url)
-                break
+    img_tag = card.select_one(_IMAGE_SEL)
+    if img_tag:
+        # src is already a full https://assets.wam.ae/... URL
+        src = str(img_tag.get("src") or img_tag.get("data-src") or "")
+        if src and "placeholder" not in src:
+            image_url = src if src.startswith("http") else _abs(src, base_url)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     summary: Optional[str] = None
-    for sel in _SUMMARY_SELECTORS:
-        tag = card.select_one(sel)
-        if tag:
-            text = _clean_text(tag.get_text(strip=True))
-            if len(text) > 15 and text != title:
-                summary = text[:500]
-                break
+    summary_tag = card.select_one(_SUMMARY_SEL)
+    if summary_tag:
+        text = _clean(summary_tag.get_text(strip=True))
+        if len(text) > 15:
+            summary = text[:500]
 
     # ── Date ──────────────────────────────────────────────────────────────────
     publish_date: Optional[datetime] = None
-    for sel in _DATE_SELECTORS:
-        date_tag = card.select_one(sel)
-        if date_tag:
-            dt_attr = date_tag.get("datetime")
-            text = str(dt_attr) if dt_attr else date_tag.get_text(strip=True)
-            text = _clean_text(text)
-            if text:
-                publish_date = _parse_date(text)
-                if publish_date:
-                    break
+    date_tag = card.select_one(_DATE_SEL)
+    if date_tag:
+        # Strip the clock icon text — get only the date text
+        raw_text = date_tag.get_text(separator=" ", strip=True)
+        # Remove icon artifacts (fa icon renders as empty or special chars)
+        date_text = _clean(re.sub(r'[\uf000-\uf8ff]', '', raw_text))
+        publish_date = _parse_arabic_date(date_text)
 
     return RawArticle(
         title=title,
@@ -270,19 +204,24 @@ def _parse_card(card: Tag, subcategory: str, base_url: str) -> Optional[RawArtic
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Content / image / date extraction for detail pages
+# Detail page extractors
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_full_content(soup: BeautifulSoup) -> str:
+def _extract_content(soup: BeautifulSoup) -> str:
     content_div: Optional[Tag] = None
-    for selector in _CONTENT_SELECTORS:
-        content_div = soup.select_one(selector)
+    for sel in _CONTENT_SELECTORS:
+        content_div = soup.select_one(sel)
         if content_div:
-            logger.debug(f"Content via selector '{selector}'")
             break
 
     if not content_div:
-        content_div = _find_content_rich_div(soup)
+        # fallback: div with most paragraph text
+        best, best_score = None, 0
+        for div in soup.find_all(["div", "section"]):
+            score = sum(len(p.get_text()) for p in div.find_all("p"))
+            if score > best_score:
+                best_score, best = score, div
+        content_div = best if best_score > 100 else None
 
     if not content_div:
         return ""
@@ -291,31 +230,16 @@ def _extract_full_content(soup: BeautifulSoup) -> str:
         for el in content_div.select(sel):
             el.decompose()
 
-    paragraphs: list[str] = []
+    paras = []
     for p in content_div.find_all("p"):
-        cls = " ".join(p.get("class") or [])
-        if "caption" in cls or "credit" in cls:
-            continue
-        text = _clean_text(p.get_text(separator=" ", strip=True))
+        text = _clean(p.get_text(separator=" "))
         if len(text) >= 20:
-            paragraphs.append(text)
+            paras.append(text)
 
-    return "\n\n".join(paragraphs)
-
-
-def _find_content_rich_div(soup: BeautifulSoup) -> Optional[Tag]:
-    best: Optional[Tag] = None
-    best_score = 0
-    for div in soup.find_all(["div", "section", "main"]):
-        paragraphs = div.find_all("p")
-        score = sum(len(p.get_text(strip=True)) for p in paragraphs)
-        if score > best_score:
-            best_score = score
-            best = div
-    return best if best_score > 100 else None
+    return "\n\n".join(paras)
 
 
-def _extract_image(soup: BeautifulSoup) -> Optional[str]:
+def _extract_image_detail(soup: BeautifulSoup) -> Optional[str]:
     og = soup.find("meta", property="og:image")
     if og and og.get("content"):
         return str(og["content"])
@@ -332,17 +256,16 @@ def _extract_image(soup: BeautifulSoup) -> Optional[str]:
         except Exception:
             continue
 
-    for selector in _IMAGE_SELECTORS:
-        img_tag = soup.select_one(selector)
-        if img_tag:
-            src = str(img_tag.get("data-src") or img_tag.get("src") or "")
-            if src and "placeholder" not in src:
-                return _absolute_url(src, WAM_BASE)
+    img = soup.select_one(".blog-thumbnail img, article img, figure img")
+    if img:
+        src = str(img.get("src") or img.get("data-src") or "")
+        if src and "placeholder" not in src:
+            return src if src.startswith("http") else _abs(src, WAM_BASE)
 
     return None
 
 
-def _extract_date(soup: BeautifulSoup) -> Optional[datetime]:
+def _extract_date_detail(soup: BeautifulSoup) -> Optional[datetime]:
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "")
@@ -368,74 +291,98 @@ def _extract_date(soup: BeautifulSoup) -> Optional[datetime]:
         except Exception:
             pass
 
-    for sel in _DATE_SELECTORS:
-        tag = soup.select_one(sel)
-        if tag:
-            text = tag.get("datetime") or tag.get_text(strip=True)
-            if text:
-                parsed = _parse_date(str(text))
-                if parsed:
-                    return parsed
+    date_tag = soup.select_one("span.post-date")
+    if date_tag:
+        text = _clean(date_tag.get_text(separator=" "))
+        return _parse_arabic_date(text)
 
     return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Date parsing — Arabic relative + absolute
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Arabic number map
+_AR_NUMS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+# Relative date patterns (Arabic)
+_RELATIVE_PATTERNS = [
+    (r"منذ\s+(\d+)\s+ثانية",  lambda n: timedelta(seconds=n)),
+    (r"منذ\s+(\d+)\s+دقيقة",  lambda n: timedelta(minutes=n)),
+    (r"منذ\s+(\d+)\s+ساعات?", lambda n: timedelta(hours=n)),
+    (r"منذ\s+(\d+)\s+أيام?",  lambda n: timedelta(days=n)),
+    (r"منذ\s+(\d+)\s+أسابيع?",lambda n: timedelta(weeks=n)),
+    (r"منذ\s+يومين",           lambda n: timedelta(days=2)),
+    (r"منذ\s+ساعتين",          lambda n: timedelta(hours=2)),
+    (r"منذ\s+دقيقتين",         lambda n: timedelta(minutes=2)),
+    (r"أمس",                   lambda n: timedelta(days=1)),
+]
+
+def _parse_arabic_date(text: str) -> Optional[datetime]:
+    if not text or len(text) < 3:
+        return None
+
+    # Normalise Arabic-Indic numerals
+    text = text.translate(_AR_NUMS).strip()
+    now = datetime.now(timezone.utc)
+
+    # Try relative patterns
+    for pattern, delta_fn in _RELATIVE_PATTERNS:
+        m = re.search(pattern, text)
+        if m:
+            try:
+                n = int(m.group(1)) if m.lastindex else 0
+                return now - delta_fn(n)
+            except Exception:
+                return now - delta_fn(0)
+
+    # Try ISO format
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        pass
+
+    # Try dateparser with Arabic locale
+    try:
+        parsed = dateparser.parse(
+            text,
+            settings={
+                "PREFER_DAY_OF_MONTH": "first",
+                "TIMEZONE": "Asia/Dubai",
+                "RETURN_AS_TIMEZONE_AWARE": True,
+                "LANGUAGES": ["ar"],
+            },
+        )
+        return parsed
+    except Exception:
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _looks_like_article_url(url: str) -> bool:
+def _is_article_url(url: str) -> bool:
     """
-    Accept only WAM article URLs.
-
-    Confirmed URL format from live site (diagnose2 slide HTML):
-      /en/article/<alphanumeric-id>-<title-slug>
-      e.g. /en/article/178wkh2-uae-president-vps-offer-condolences-chairman
-           /en/article/c0fuuro-uae-leaders-congratulate-president-azerbaijan
-
-    Rejects:
-      - Non-WAM domains
-      - /en/category/* (listing pages)
-      - /en/home/* (homepage)
-      - /ar/* (Arabic versions)
-      - /en/financial-market/* (market data)
+    Accept:  https://www.wam.ae/ar/article/<id>-<slug>
+    Reject:  category pages, homepage, other domains
     """
     if not url.startswith("https://www.wam.ae"):
         return False
-    if "/ar/article/" not in url:
+    if "/article/" not in url:
         return False
-    # Ensure there's something after /en/article/
-    after = url.split("/ar/article/")[-1].strip("/")
+    after = url.split("/article/")[-1].strip("/")
     return len(after) > 5
 
 
-def _parse_date(date_str: str) -> Optional[datetime]:
-    if not date_str or len(date_str) < 4:
-        return None
-    try:
-        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-    except Exception:
-        pass
-    try:
-        return dateparser.parse(
-            date_str,
-            settings={
-                "PREFER_DAY_OF_MONTH": "first",
-                "TIMEZONE": "Asia/Dubai",
-                "RETURN_AS_TIMEZONE_AWARE": False,
-            },
-        )
-    except Exception:
-        return None
-
-
-def _clean_text(text: str) -> str:
-    text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", text)
+def _clean(text: str) -> str:
+    text = re.sub(r"[\u200b\u200c\u200d\ufeff\u00a0]", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 
-def _absolute_url(href: str, base: str) -> str:
+def _abs(href: str, base: str) -> str:
     href = href.strip()
     if href.startswith("http"):
         return href
